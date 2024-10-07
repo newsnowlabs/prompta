@@ -1,20 +1,132 @@
-FROM node:20 as builder
+# syntax=docker/dockerfile:1.3-labs
 
-RUN apt-get update; apt install -y curl python-is-python3 pkg-config build-essential
-RUN mkdir /app
-WORKDIR /app
+FROM node:20-slim as builder
 
-COPY . .
+# Set sensible shell
+SHELL ["/bin/bash", "-e", "-c"]
 
+# Install pnpm globally
 RUN npm install -g pnpm
+
+# Install needed debian packages
+RUN <<EOF
+apt-get update
+DEBIAN_FRONTEND=noninteractive
+apt install -y --no-install-recommends curl python-is-python3 pkg-config build-essential s6 nginx unzip
+apt-get clean
+rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*					     
+EOF
+
+# Install app
+ENV HOME=/home/prompta
+ENV APP=$HOME/app
+ENV SYNC_SERVER_PATH=/db/
+ENV DATA=/data
+
+# Create entrypoint, prompta user, and key directories
+RUN <<EOF
+cat <<EOT >/entrypoint.sh
+#!/bin/bash
+exec /usr/bin/s6-svscan $HOME/s6
+EOT
+
+useradd --home-dir $HOME --shell /bin/bash prompta
+mkdir -p $APP $DATA
+chown -R prompta:prompta $HOME $DATA /entrypoint.sh
+chmod 755 /entrypoint.sh
+EOF
+
+# Do the rest as prompta user, in the app dir
+USER prompta
+WORKDIR $APP
+
+# Copy in the code
+COPY --chown=prompta:prompta . .
+
+# Make client app's default sync-server URI relative to URI on which it's hosted
+RUN sed -r -i.bak "s|return.*https://prompta-production.up.railway.app.*$|return window.location.href.replace(/(https?:\\\/\\\/[^\\\/]+)(\\\/.*)?$/, \"\$1$SYNC_SERVER_PATH\");|" src/lib/sync/vlcn.ts
+
+# Disable telemetry
+RUN sed -r -i.bak 's!(cap\(|window.posthog.capture\()!return; // &!' src/lib/capture.ts
+
+# Install packages for app
 RUN pnpm install
-RUN pnpm run build:server
 
+# Build static client
+RUN pnpm run ui:build-static
 
-FROM node:20-slim as dist
+# Compile db server typescript
+RUN pnpm tsc -p ./tsconfig.server.json
 
-COPY --from=builder /app /app
-WORKDIR /app
-ENV NODE_ENV production
-ENV PORT 8080
-CMD [ "node", "./dist-server/server.js" ]
+# Create s6 runscripts
+WORKDIR $HOME
+
+RUN <<EOF
+mkdir -p s6/db s6/www
+
+cat <<EOT >$HOME/s6/www/run
+#!/bin/bash
+/usr/sbin/nginx -c $APP/nginx.conf -g 'daemon off;'
+EOT
+
+cat <<EOT >$HOME/s6/db/run
+#!/bin/bash
+cd $APP
+export PORT=8081
+export HOST=127.0.0.1
+export BODYLIMIT=100
+export RAILWAY_VOLUME_MOUNT_PATH="$DATA"
+node ./dist-server/server.js
+EOT
+
+chmod 755 $HOME/s6/*/run
+
+cat <<'EOT' >$APP/nginx.conf
+
+pid /tmp/nginx.pid;
+worker_processes auto;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    include       /etc/nginx/mime.types;
+    default_type  application/octet-stream;
+
+    client_body_temp_path /tmp;
+    proxy_temp_path /tmp;
+    fastcgi_temp_path /tmp;
+    uwsgi_temp_path /tmp;
+    scgi_temp_path /tmp;
+    access_log /dev/stdout;
+    error_log /dev/stderr;
+
+    server {
+        listen 8080;
+
+        location / {
+            root APP/build;
+            index index.html;
+        }
+
+        location ~ ^SYNC_SERVER_PATH(.*) {
+            client_max_body_size 0;
+            proxy_read_timeout 36000s;
+            proxy_pass http://127.0.0.1:8081/$1$is_args$args;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Cookie $http_cookie;
+        }
+    }
+}
+EOT
+
+sed -ri "s|APP|$APP|g; s|SYNC_SERVER_PATH|$SYNC_SERVER_PATH|g" $APP/nginx.conf
+EOF
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+EXPOSE 8080
